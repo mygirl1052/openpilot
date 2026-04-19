@@ -11,6 +11,10 @@ from openpilot.selfdrive.selfdrived.events import Events, ET
 
 from openpilot.common.params import Params
 
+## >> itsjjoo 추가/수정
+from datetime import datetime
+## << itsjjoo 추가/수정
+
 ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
 EventName = log.OnroadEvent.EventName
@@ -50,6 +54,12 @@ class CarSpecificEvents:
     self.mute_seatbelt = False
     self.vCruise_prev = 250
     self.carrotCruise_prev = False
+    ## >> itsjjoo 추가/수정
+    self.cancel_button_cnt = 0
+    self.cancel_button_long_cnt = 10
+    self.cancel_button_delay_time = 2
+    self.cancel_button_last_time = datetime.now()
+    ## << itsjjoo 추가/수정
 
   def update_params(self):
     if self.frame % 100 == 0:
@@ -239,9 +249,21 @@ class CarSpecificEvents:
       # TODO: only check the cancel button with openpilot longitudinal on all brands to match panda safety
       if b.type == ButtonType.cancel and (allow_button_cancel or not self.CP.pcmCruise):
         events.add(EventName.buttonCancel)
-        if CS.gearShifter == GearShifter.park and not self.do_shutdown:
+        ## >> itsjjoo 추가/수정
+        #if CS.gearShifter == GearShifter.park and not self.do_shutdown:
+        #  self.do_shutdown = True
+        #  self.params.put_bool("DoShutdown", True)
+        currentTime = datetime.now()
+        if (currentTime - self.cancel_button_last_time).total_seconds() <= self.cancel_button_delay_time:
+          self.cancel_button_cnt += 1
+        else:
+          self.cancel_button_cnt = 1
+          self.cancel_button_last_time = datetime.now()
+
+        if CS.gearShifter == GearShifter.park and not self.do_shutdown and self.cancel_button_cnt >= self.cancel_button_long_cnt:
           self.do_shutdown = True
           self.params.put_bool("DoShutdown", True)
+        ## << itsjjoo 추가/수정
 
     # Handle permanent and temporary steering faults
     self.steering_unpressed = 0 if CS.steeringPressed else self.steering_unpressed + 1

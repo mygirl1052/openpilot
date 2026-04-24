@@ -18,6 +18,7 @@ let carsLoadPromise = null;
 let settingsLoadPromise = null;
 let toolsMetaLoadPromise = null;
 let toolsMetaLoadedAt = 0;
+let toolsMetaLastValues = null;
 let uiWarmupTimer = null;
 const SETTING_VALUES_TTL_MS = 60000;
 let settingValueWarmupTimer = null;
@@ -25,6 +26,11 @@ let settingValueWarmupPromise = null;
 const settingValueCache = new Map();
 const settingGroupValueCache = new Map();
 const settingGroupValuePromises = new Map();
+
+let ORIGIN_USERNAME = "origin";
+let BRANCH_REMOTE_NAMES = ["origin"];
+let BRANCH_REMOTE_OWNERS = Object.create(null);
+let BRANCH_GROUP_OPEN = Object.create(null);
 
 function hasFreshPageData(lastLoadedAt, ttlMs = PAGE_DATA_TTL_MS) {
   return Number.isFinite(lastLoadedAt) && lastLoadedAt > 0 && (Date.now() - lastLoadedAt) < ttlMs;
@@ -1869,6 +1875,16 @@ function toolsOutCommitCurrent() {
   renderToolsOut();
 }
 
+function toolsLogNotice(message, options = {}) {
+  const text = normalizeToolsOutText(message);
+  if (!text) return;
+  const label = options.label ? String(options.label).trim() : "notice";
+  toolsOutCommitCurrent();
+  toolsOutAppend(`[${label}]\n${text}`);
+  if (options.meta !== false) toolsMetaSet(text.split("\n")[0]);
+  if (options.clearProgress !== false) toolsProgressSet(null, { active: false });
+}
+
 function getToolCommandPreview(action, payload = {}) {
   switch (action) {
     case "shell_cmd": return String(payload.cmd || "").trim() || "command";
@@ -1877,6 +1893,7 @@ function getToolCommandPreview(action, payload = {}) {
     case "git_reset": return `git reset --${payload.mode || "hard"} ${payload.target || "HEAD"}`.trim();
     case "git_checkout": return `git checkout ${payload.branch || ""}`.trim();
     case "git_branch_list": return "change branch";
+    case "git_remote_add": return `git remote add/set-url ${payload.name || ""}`.trim();
     case "send_tmux_log": return "capture tmux";
     case "server_tmux_log": return "send tmux";
     case "install_required": return "install flask";
@@ -1885,6 +1902,9 @@ function getToolCommandPreview(action, payload = {}) {
     case "rebuild_all": return "rebuild all";
     case "backup_settings": return "backup settings";
     case "reboot": return "reboot";
+    case "git_reset_repo_fetch": return "reset repo (fetch)";
+    case "git_reset_repo_checkout": return `reset repo (checkout ${payload.branch || "unknown"})`;
+    case "reset_calib": return "reset calib";
     default: return action;
   }
 }
@@ -1923,29 +1943,7 @@ function renderToolsMeta() {
   });
   actionsEl.appendChild(langBtn);
 
-  if (toolsMetaInfoText) {
-    const infoBtn = document.createElement("button");
-    infoBtn.type = "button";
-    infoBtn.className = "smallBtn tools-meta__infoBtn";
-    infoBtn.textContent = LANG === "en"
-      ? "Device Info"
-      : LANG === "zh"
-        ? "设备信息"
-        : "기기정보";
-    infoBtn.addEventListener("click", () => {
-      const title = LANG === "en"
-        ? "Device Info"
-        : LANG === "zh"
-          ? "设备信息"
-          : "기기정보";
-      appAlert(toolsMetaInfoDialogText || toolsMetaInfoText, {
-        title,
-        html: true,
-        messageHtml: toolsMetaInfoDialogText,
-      });
-    });
-    actionsEl.appendChild(infoBtn);
-  }
+
 
   meta.appendChild(actionsEl);
 }
@@ -1969,8 +1967,16 @@ function buildToolsMetaInfo(values = {}) {
 }
 
 function formatToolsMetaDate(value) {
-  const raw = String(value || "").trim();
+  let raw = String(value || "").replace(/['"]/g, "").trim();
   if (!raw) return "";
+
+  // Support "1730000000 2024-10-27..."
+  const parts = raw.split(" ");
+  if (parts.length > 1 && /^\d{10,}$/.test(parts[0])) {
+    const d = new Date(parseInt(parts[0], 10) * 1000);
+    if (!isNaN(d)) return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+  }
+
   const m = raw.match(/^(\d{4})[-./](\d{2})[-./](\d{2})/);
   if (m) return `${m[1]}.${m[2]}.${m[3]}`;
   const ts = Date.parse(raw);
@@ -2013,10 +2019,10 @@ function buildToolsMetaInfoDialog(values = {}) {
   const serial = String(values.HardwareSerial || "").trim();
   const gitPullTime = formatToolsMetaDateTime(values.GitPullTime);
   const labels = LANG === "en"
-    ? { branch: "Branch", commit: "Commit", dongle: "Dongle ID", serial: "Serial", gitPull: "Recent update" }
+    ? { branch: "Branch", commit: "Commit", deviceType: "Device", dongle: "Dongle ID", serial: "Serial", gitPull: "Recent update", position: "Position" }
     : LANG === "zh"
-      ? { branch: "分支", commit: "提交", dongle: "Dongle ID", serial: "序列号", gitPull: "最近更新" }
-      : { branch: "브랜치", commit: "커밋", dongle: "동글ID", serial: "시리얼", gitPull: "최근 업데이트" };
+      ? { branch: "分支", commit: "提交", deviceType: "设备型号", dongle: "Dongle ID", serial: "序列号", gitPull: "最近更新", position: "安装角度" }
+      : { branch: "브랜치", commit: "커밋", deviceType: "기기", dongle: "동글ID", serial: "시리얼", gitPull: "최근 업데이트", position: "설치각도" };
   const htmlEscape = typeof escapeHtml === "function"
     ? escapeHtml
     : (value) => String(value)
@@ -2026,17 +2032,44 @@ function buildToolsMetaInfoDialog(values = {}) {
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
   const lines = [];
-  if (branch) lines.push(`<div class="app-dialog__metaLine">${htmlEscape(labels.branch)}: ${htmlEscape(branch)}</div>`);
+  const remote = String(values.GitRemote || "").trim();
+  const shortRemote = remote ? remote.replace(/^https?:\/\/[^/]+\//, "").replace(/\.git$/, "") : "";
+  const branchText = branch + (shortRemote ? ` (${shortRemote})` : "");
+  if (branchText) lines.push(`<div class="app-dialog__metaLine">${htmlEscape(labels.branch)}: ${htmlEscape(branchText)}</div>`);
   if (commit) {
-    const commitText = `${commit.slice(0, 7)}${commitDate ? `    ${commitDate}` : ""}`;
+    const commitText = `${commit.slice(0, 7)}${commitDate ? ` (${commitDate})` : ""}`;
     lines.push(`<div class="app-dialog__metaLine">${htmlEscape(labels.commit)}: ${htmlEscape(commitText)}</div>`);
   }
+
   if (dongleId) lines.push(`<div class="app-dialog__metaLine">${htmlEscape(labels.dongle)}: ${htmlEscape(dongleId)}</div>`);
   if (serial) lines.push(`<div class="app-dialog__metaLine">${htmlEscape(labels.serial)}: ${htmlEscape(serial)}</div>`);
+  const position = String(values.DevicePosition || "").trim();
+  lines.push(`<div class="app-dialog__metaLine">${htmlEscape(labels.position)}: ${htmlEscape(position)}</div>`);
   if (gitPullTime) {
     lines.push(`<div class="app-dialog__metaSubtle">${htmlEscape(labels.gitPull)}: ${htmlEscape(gitPullTime)}</div>`);
   }
-  return `<div class="app-dialog__metaList">${lines.join("")}</div>`;
+  return `<div class="app-dialog__metaList" id="toolsMetaListContent">${lines.join("")}</div>`;
+}
+
+function buildToolsMetaPlainText(values = {}) {
+  const branch = String(values.GitBranch || "").trim();
+  const commit = String(values.GitCommit || "").trim();
+  const commitDate = formatToolsMetaDate(values.GitCommitDate);
+  const dongleId = String(values.DongleId || "").trim();
+  const serial = String(values.HardwareSerial || "").trim();
+  const gitPullTime = formatToolsMetaDateTime(values.GitPullTime);
+  const remote = String(values.GitRemote || "").trim();
+  const shortRemote = remote ? remote.replace(/^https?:\/\/[^/]+\//, "").replace(/\.git$/, "") : "";
+  const branchText = branch + (shortRemote ? ` (${shortRemote})` : "");
+  const position = String(values.DevicePosition || "").trim();
+  const lines = [];
+  if (branchText) lines.push(`Branch: ${branchText}`);
+  if (commit) lines.push(`Commit: ${commit.slice(0, 7)}${commitDate ? ` (${commitDate})` : ""}`);
+  if (dongleId) lines.push(`DongleID: ${dongleId}`);
+  if (serial) lines.push(`Serial: ${serial}`);
+  if (position) lines.push(`Position: ${position}`);
+  if (gitPullTime) lines.push(`Updated: ${gitPullTime}`);
+  return lines.join("\n");
 }
 
 function rerenderPageLangUi() {
@@ -2083,10 +2116,11 @@ async function refreshToolsMetaInfo(options = {}) {
   }
 
   toolsMetaLoadPromise = (async () => {
-    const values = await bulkGet(["GitBranch", "GitCommit", "GitCommitDate", "DongleId", "HardwareSerial", "GitPullTime"]);
+    const values = await bulkGet(["GitBranch", "GitCommit", "GitCommitDate", "GitRemote", "DeviceType", "DongleId", "HardwareSerial", "GitPullTime", "DevicePosition"]);
     toolsMetaInfoText = buildToolsMetaInfo(values);
     toolsMetaInfoDialogText = buildToolsMetaInfoDialog(values);
     toolsMetaLoadedAt = Date.now();
+    toolsMetaLastValues = values;
     if (!silent || CURRENT_PAGE === "tools") renderToolsMeta();
     return values;
   })().finally(() => {
@@ -2096,8 +2130,49 @@ async function refreshToolsMetaInfo(options = {}) {
   return toolsMetaLoadPromise;
 }
 
+async function syncDeviceLanguageOnce() {
+  if (typeof bulkGet !== "function" || typeof setParam !== "function") return;
+  try {
+    const SYNC_KEY = "carrot_device_lang_synced";
+    if (localStorage.getItem(SYNC_KEY) === "1") return;
+
+    const values = await bulkGet(["LanguageSetting"]);
+    const currentLang = String(values["LanguageSetting"] || "").trim();
+
+    const browserLang = (navigator.language || navigator.userLanguage || "en").toLowerCase();
+    let targetParam = "main_en";
+    if (browserLang.startsWith("ko")) targetParam = "main_ko";
+    else if (browserLang.startsWith("zh")) targetParam = browserLang.includes("tw") || browserLang.includes("hk") ? "main_zh-CHT" : "main_zh-CHS";
+    else if (browserLang.startsWith("ja")) targetParam = "main_ja";
+    else if (browserLang.startsWith("de")) targetParam = "main_de";
+    else if (browserLang.startsWith("fr")) targetParam = "main_fr";
+    else if (browserLang.startsWith("es")) targetParam = "main_es";
+    else if (browserLang.startsWith("pt")) targetParam = "main_pt-BR";
+    else if (browserLang.startsWith("tr")) targetParam = "main_tr";
+    else if (browserLang.startsWith("ar")) targetParam = "main_ar";
+    else if (browserLang.startsWith("th")) targetParam = "main_th";
+
+    if (currentLang !== targetParam) {
+      await setParam("LanguageSetting", targetParam);
+      localStorage.setItem(SYNC_KEY, "1");
+      // show notification after a short delay so the page finishes loading
+      setTimeout(() => {
+        const msg = LANG === "ko"
+          ? "기기 언어를 변경했습니다.\n기기를 재부팅해야 적용됩니다."
+          : "Device language has been changed.\nPlease reboot the device to apply.";
+        openAppDialog({ mode: "alert", title: "Device Language", message: msg });
+      }, 800);
+      return;
+    }
+    localStorage.setItem(SYNC_KEY, "1");
+  } catch (e) {
+    console.log("Language sync failed:", e);
+  }
+}
+
 function runUiWarmup() {
   return Promise.allSettled([
+    syncDeviceLanguageOnce(),
     loadCurrentCar({ resetRetry: false, ttlMs: PAGE_DATA_TTL_MS }),
     loadRecordState({ ttlMs: PAGE_DATA_TTL_MS }),
     refreshToolsMetaInfo({ silent: true, ttlMs: PAGE_DATA_TTL_MS }),
@@ -2284,7 +2359,7 @@ function showError(action, error) {
   const msg = (typeof error === "object" && error.message) ? error.message : String(error);
   toolsMetaSet(title);
   toolsProgressSet(null, { active: false });
-  appAlert(msg, { title });
+  toolsLogNotice(msg, { label: action, meta: false });
 }
 
 let branchPickerCloseTimer = null;
@@ -2331,6 +2406,178 @@ function closeBranchPicker(immediate = false) {
 if (appBranchPickerBackdrop) appBranchPickerBackdrop.onclick = () => closeBranchPicker();
 if (appBranchPickerClose) appBranchPickerClose.onclick = () => closeBranchPicker();
 
+function parseGitHubOwner(url) {
+  const text = String(url || "").trim();
+  if (!text) return "";
+  const httpsMatch = text.match(/github\.com\/([^\/:\s]+)\//);
+  if (httpsMatch) return httpsMatch[1];
+  const sshMatch = text.match(/github\.com[:\/]([^\/:\s]+)\//);
+  return sshMatch ? sshMatch[1] : "";
+}
+
+function resetBranchRemoteContext() {
+  ORIGIN_USERNAME = "origin";
+  BRANCH_REMOTE_NAMES = ["origin"];
+  BRANCH_REMOTE_OWNERS = Object.create(null);
+}
+
+function syncBranchRemoteContext(result = {}) {
+  const remotes = Array.isArray(result.remotes) ? result.remotes.map((r) => String(r || "").trim()).filter(Boolean) : [];
+  BRANCH_REMOTE_NAMES = remotes.length ? remotes : ["origin"];
+  BRANCH_REMOTE_OWNERS = Object.create(null);
+
+  const remoteUrls = result.remote_urls && typeof result.remote_urls === "object" ? result.remote_urls : {};
+  for (const [name, url] of Object.entries(remoteUrls)) {
+    const owner = parseGitHubOwner(url);
+    if (owner) BRANCH_REMOTE_OWNERS[name] = owner;
+  }
+
+  if (BRANCH_REMOTE_OWNERS.origin) {
+    ORIGIN_USERNAME = BRANCH_REMOTE_OWNERS.origin;
+  }
+}
+
+function normalizeBranchItems(result = {}) {
+  const items = Array.isArray(result.branch_items) ? result.branch_items : [];
+  if (items.length) {
+    return items
+      .map((item) => {
+        const kind = item && item.kind === "remote" ? "remote" : "local";
+        const remote = String(item?.remote || "").trim();
+        const name = String(item?.name || item?.label || item?.ref || "").trim();
+        const ref = String(item?.ref || (kind === "remote" && remote && name ? `${remote}/${name}` : name)).trim();
+        if (!ref || !name) return null;
+        return {
+          id: String(item?.id || `${kind}:${remote}:${name}`),
+          kind,
+          ref,
+          remote,
+          name,
+          label: String(item?.label || name).trim() || name,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  const refs = Array.isArray(result.branches) ? result.branches : [];
+  return refs
+    .map((ref) => ({ kind: "legacy", ref: String(ref || "").trim() }))
+    .filter((item) => item.ref);
+}
+
+function getBranchDisplayInfo(entry) {
+  if (entry && typeof entry === "object" && entry.kind !== "legacy") {
+    const kind = entry.kind === "remote" ? "remote" : "local";
+    const ref = String(entry.ref || "").trim();
+    const name = String(entry.name || entry.label || ref).trim();
+
+    if (kind === "local") {
+      return {
+        ref,
+        label: name,
+        groupKey: "local",
+        groupTitle: "local",
+        groupRank: 0,
+        kind: "local",
+        name,
+        checkoutPayload: { branch: ref, kind: "local", name },
+      };
+    }
+
+    const remoteName = String(entry.remote || "").trim();
+    const owner = BRANCH_REMOTE_OWNERS[remoteName] || (remoteName === "origin" ? ORIGIN_USERNAME : remoteName);
+    return {
+      ref,
+      label: String(entry.label || name).trim() || name,
+      groupKey: `remote:${remoteName}:${owner}`,
+      groupTitle: remoteName === "origin" ? `${remoteName} / ${owner}` : `remote / ${owner}`,
+      groupRank: remoteName === "origin" ? 1 : 2,
+      kind: "remote",
+      remote: remoteName,
+      name,
+      checkoutPayload: { branch: ref, kind: "remote", remote: remoteName, name },
+    };
+  }
+
+  const raw = String(entry?.ref || entry || "").trim();
+  const parts = raw.split("/").filter(Boolean);
+  const first = parts[0] || "";
+  const isRemoteRef = parts.length >= 2 && BRANCH_REMOTE_NAMES.includes(first);
+
+  if (!isRemoteRef) {
+    return {
+      ref: raw,
+      label: raw,
+      groupKey: "local",
+      groupTitle: "local",
+      groupRank: 0,
+      kind: "local",
+      name: raw,
+      checkoutPayload: { branch: raw },
+    };
+  }
+
+  const remoteName = first;
+  const rest = parts.slice(1);
+
+  const owner = BRANCH_REMOTE_OWNERS[remoteName] || (remoteName === "origin" ? ORIGIN_USERNAME : remoteName);
+  return {
+    ref: raw,
+    label: rest.join("/") || raw,
+    groupKey: `remote:${remoteName}:${owner}`,
+    groupTitle: remoteName === "origin" ? `${remoteName} / ${owner}` : `remote / ${owner}`,
+    groupRank: remoteName === "origin" ? 1 : 2,
+    kind: "remote",
+    remote: remoteName,
+    name: rest.join("/") || raw,
+    checkoutPayload: { branch: raw },
+  };
+}
+
+function isCurrentBranchItem(info) {
+  return Boolean(info && info.kind === "local" && CURRENT_BRANCH_NAME && info.name === CURRENT_BRANCH_NAME);
+}
+
+function getBranchGroups() {
+  const groups = new Map();
+  for (const br of BRANCHES) {
+    const info = getBranchDisplayInfo(br);
+    if (!info.ref || !info.label) continue;
+
+    let group = groups.get(info.groupKey);
+    if (!group) {
+      group = {
+        key: info.groupKey,
+        title: info.groupTitle,
+        rank: info.groupRank,
+        items: [],
+        hasCurrent: false,
+      };
+      groups.set(info.groupKey, group);
+    }
+
+    const current = isCurrentBranchItem(info);
+    group.hasCurrent = group.hasCurrent || current;
+    group.items.push({ ...info, current });
+  }
+
+  return Array.from(groups.values()).sort((a, b) => {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    return a.title.localeCompare(b.title);
+  });
+}
+
+function isBranchGroupOpen(group) {
+  if (Object.prototype.hasOwnProperty.call(BRANCH_GROUP_OPEN, group.key)) {
+    return Boolean(BRANCH_GROUP_OPEN[group.key]);
+  }
+  return group.key === "local" || group.rank === 1 || group.hasCurrent;
+}
+
+function branchCountLabel(count) {
+  return count === 1 ? "1 branch" : `${count} branches`;
+}
+
 
 function initToolsPage() {
   const bindOnce = (id, fn) => {
@@ -2353,7 +2600,10 @@ function initToolsPage() {
       const body = group.querySelector(".tools-group__body");
       if (!toggle || !body) return;
 
-      const shouldOpen = group.dataset.toolsGroup === "git";
+      const groupName = group.dataset.toolsGroup;
+      const savedState = localStorage.getItem("tools_group_" + groupName);
+      const shouldOpen = savedState !== null ? savedState === "true" : true;
+
       group.classList.toggle("is-open", shouldOpen);
       body.hidden = !shouldOpen;
       body.classList.toggle("hidden", !shouldOpen);
@@ -2365,6 +2615,7 @@ function initToolsPage() {
         body.classList.toggle("hidden", !nextOpen);
         group.classList.toggle("is-open", nextOpen);
         toggle.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+        localStorage.setItem("tools_group_" + groupName, nextOpen ? "true" : "false");
       });
     });
   };
@@ -2385,6 +2636,33 @@ function initToolsPage() {
   toolsProgressSet(null, { active: false });
   refreshToolsMetaInfo().catch(() => {});
   initToolsGroups();
+
+  bindOnce("btnDeviceInfo", async () => {
+    let title = LANG === "en" ? "Device Info" : LANG === "zh" ? "设备信息" : "기기정보";
+    
+    try {
+      if (!toolsMetaLastValues && !toolsMetaLoadPromise) {
+        await refreshToolsMetaInfo({ ttlMs: 3600000 });
+      }
+      const values = toolsMetaLoadPromise ? await toolsMetaLoadPromise : toolsMetaLastValues;
+      if (values) {
+        const deviceType = String(values.DeviceType || "").trim();
+        if (deviceType) {
+          const deviceFriendly = { tici: "c3", tizi: "c3x", mici: "c4" };
+          const friendly = deviceFriendly[deviceType] || deviceType;
+          const label = friendly !== deviceType ? `${friendly}/${deviceType}` : deviceType;
+          title += `(${label})`;
+        }
+      }
+    } catch (e) {}
+
+    appAlert(toolsMetaInfoDialogText || toolsMetaInfoText, {
+      title,
+      html: true,
+      messageHtml: toolsMetaInfoDialogText,
+      copyText: buildToolsMetaPlainText(toolsMetaLastValues || {}),
+    });
+  });
 
   bindOnce("btnGitPull", async () => {
     try {
@@ -2437,8 +2715,200 @@ function initToolsPage() {
     if (!mode) return;
     await runGitResetMode(mode);
   });
+
+  bindOnce("btnGitRemote", async () => {
+    const title = LANG === "ko" ? "저장소 주소 변경" : "Change Repository";
+    let defaultUrl = "";
+    try {
+      const v = await bulkGet(["GitRemote"]);
+      if (v && v.GitRemote) defaultUrl = String(v.GitRemote).trim();
+    } catch (e) {}
+
+    const msg = LANG === "ko"
+      ? `현재 주소: ${defaultUrl}\n\n새로운 GitHub 저장소 주소를 붙여넣으세요.\n(해당 저장소로 연결을 덮어씁니다)`
+      : `Current: ${defaultUrl}\n\nEnter new GitHub repository URL.\n(This will overwrite the current connection)`;
+    
+    const newUrl = await appPrompt(msg, defaultUrl, { title });
+    if (!newUrl || newUrl.trim() === "" || newUrl.trim() === defaultUrl) return;
+
+    try {
+      const waitMsg = LANG === "ko"
+        ? "저장소 데이터를 받아오는 중입니다.\n처음 연결하는 저장소의 경우 수 분이 걸릴 수 있습니다.\n잠시만 기다려 주세요..."
+        : "Fetching repository data.\nThis may take a few minutes for new repositories.\nPlease wait...";
+      toolsLogNotice(waitMsg, { label: "change repository" });
+      await runTool("git_remote_set", { url: newUrl.trim() });
+      await refreshToolsMetaInfo();
+      const successMsg = LANG === "ko" 
+        ? "저장소가 성공적으로 변경되었습니다.\n[change branch] 버튼을 눌러 새 저장소의 브랜치를 선택해 주세요." 
+        : "Repository changed successfully.\nClick [change branch] to select a branch.";
+      toolsLogNotice(successMsg, { label: "change repository" });
+    } catch (e) {
+      showError("change repository", e);
+    }
+  });
   bindOnce("btnGitBranch", async () => {
     await loadBranchesAndShow();
+  });
+
+  bindOnce("btnGitAddRemote", async () => {
+    const title = LANG === "ko" ? "리모트 추가/갱신" : "Add/Update Remote";
+    const nameInput = await appPrompt(
+      LANG === "ko" ? "리모트 이름을 입력하세요 (예: remote)" : "Enter remote name (e.g. remote)",
+      { title, placeholder: "remote" }
+    );
+    if (!nameInput || !nameInput.trim()) return;
+    const remoteName = nameInput.trim();
+
+    const urlInput = await appPrompt(
+      LANG === "ko" ? `'${remoteName}' 리모트의 URL을 입력하세요` : `Enter URL for '${remoteName}'`,
+      { title, placeholder: "https://github.com/user/repo" }
+    );
+    if (!urlInput || !urlInput.trim()) return;
+
+    try {
+      await runTool("git_remote_add", { name: remoteName, url: urlInput.trim() });
+      toolsLogNotice(LANG === "ko" ? `리모트 '${remoteName}' 추가/갱신 완료` : `Remote '${remoteName}' added/updated`, { label: "git_remote_add" });
+    } catch (e) {
+      showError("git_remote_add", e);
+    }
+  });
+
+  bindOnce("btnGitLog", async () => {
+    try {
+      // 1. 터미널 출력
+      await runTool("git_log", { count: 20 });
+
+      // 2. 팝업 UI 표시를 위한 데이터 다시 로드
+      const res = await postJson("/api/tools", { action: "git_log", count: 20 });
+      if (!res.ok) throw new Error(res.error || "Failed to load git log");
+      const commits = res.commits || [];
+      const currentCommit = res.current_commit || "";
+      if (!commits.length) {
+        toolsLogNotice("No commits found", { label: "git_log" });
+        return;
+      }
+
+      const selected = await openAppDialog({
+        mode: "choice",
+        title: "git log",
+        message: LANG === "ko" ? "이동할 커밋을 선택하세요" : "Select commit to checkout",
+        cancelLabel: UI_STRINGS[LANG].cancel || "Cancel",
+        choices: commits.map(c => {
+          const isCurrent = currentCommit && c.hash.startsWith(currentCommit);
+          const badgeHtml = isCurrent
+            ? ` <span class="app-branch-picker__badge">${getUIText("branch_current", "Current")}</span>`
+            : "";
+          return {
+            labelHtml: `<span class="app-branch-picker__label"><span style="color:#4caf50;font-weight:700;font-family:monospace;margin-right:8px;">${escapeHtml(c.hash)}</span>${escapeHtml(c.message)}</span>${badgeHtml}`,
+            value: c.hash,
+            className: isCurrent ? "is-current" : "",
+          };
+        }),
+      });
+      if (!selected) return;
+
+      const confirmMsg = LANG === "ko"
+        ? `이 커밋으로 이동하시겠습니까?\n\n${selected}`
+        : `Checkout this commit?\n\n${selected}`;
+      if (!await appConfirm(confirmMsg, { title: "git checkout" })) return;
+
+      const resetRes = await postJson("/api/tools", { action: "git_reset", mode: "hard", target: selected });
+      if (!resetRes.ok) throw new Error(resetRes.error || "Reset failed");
+      
+      toolsLogNotice(LANG === "ko" ? "이동 완료" : "Checkout complete", { label: "git_log" });
+      await refreshToolsMetaInfo();
+    } catch (e) {
+      showError("git_log", e);
+    }
+  });
+
+  bindOnce("btnGitResetRepo", async () => {
+    const title = LANG === "ko" ? "저장소 초기화" : "Reset Repository";
+    const msg = LANG === "ko"
+      ? "주의: 기존 origin을 삭제하고 'ajouatom/openpilot'으로 재설정합니다.\n모든 로컬 변경사항이 삭제됩니다. 진행하시겠습니까?"
+      : "Warning: This will remove origin and re-add 'ajouatom/openpilot'.\nAll local changes will be lost. Proceed?";
+    
+    if (!await appConfirm(msg, { title, danger: true })) return;
+
+    try {
+      // Phase 1: fetch remote and get branch list
+      const fetchResult = await runTool("git_reset_repo_fetch");
+      const branches = fetchResult.branches || [];
+      if (!branches.length) {
+        toolsLogNotice(LANG === "ko" ? "브랜치를 찾을 수 없습니다" : "No branches found", { label: "git_reset_repo" });
+        return;
+      }
+
+      // Phase 2: let user pick a branch
+      const selected = await openAppDialog({
+        mode: "choice",
+        title: LANG === "ko" ? "브랜치 선택" : "Select Branch",
+        message: LANG === "ko" ? "초기화할 브랜치를 선택하세요" : "Select branch to reset to",
+        cancelLabel: UI_STRINGS[LANG].cancel || "Cancel",
+        choices: branches.map(b => ({ label: b, value: b })),
+      });
+      if (!selected) return;
+
+      // Phase 3: checkout selected branch
+      await runTool("git_reset_repo_checkout", { branch: selected });
+      toolsLogNotice(LANG === "ko" ? `'${selected}' 브랜치로 초기화 완료` : `Reset to '${selected}' complete`, { label: "git_reset_repo" });
+      await refreshToolsMetaInfo();
+
+      if (await appConfirm(UI_STRINGS[LANG].confirm_reboot || "Reboot now?", {
+        title: UI_STRINGS[LANG].reboot || "Reboot",
+      })) {
+        await runTool("reboot");
+      }
+    } catch (e) {
+      showError("git_reset_repo", e);
+    }
+  });
+
+  bindOnce("btnResetCalib", async () => {
+    const title = LANG === "ko" ? "캘리브레이션 초기화" : "ReCalibration";
+    const msg = LANG === "ko" 
+      ? "캘리브레이션을 초기화하시겠습니까?\n초기화 후 자동으로 재부팅됩니다."
+      : "Are you sure you want to reset calibration?\nDevice will reboot automatically.";
+    if (!await appConfirm(msg, { title })) return;
+    try {
+      await runTool("reset_calib");
+    } catch (e) {
+      showError("reset_calib", e);
+    }
+  });
+
+  bindOnce("btnDeviceLang", async () => {
+    const choices = [
+      { label: "한국어", value: "main_ko" },
+      { label: "English", value: "main_en" },
+      { label: "中文(简体)", value: "main_zh-CHS" },
+      { label: "中文(繁體)", value: "main_zh-CHT" },
+      { label: "日本語", value: "main_ja" },
+      { label: "Deutsch", value: "main_de" },
+      { label: "Français", value: "main_fr" },
+      { label: "Português", value: "main_pt-BR" },
+      { label: "Español", value: "main_es" },
+      { label: "Türkçe", value: "main_tr" },
+      { label: "العربية", value: "main_ar" },
+      { label: "ไทย", value: "main_th" },
+    ];
+    const val = await openAppDialog({
+      mode: "choice",
+      title: "Device Language",
+      message: LANG === "ko" ? "기기 언어를 선택하세요." : "Select language for the device UI",
+      cancelLabel: UI_STRINGS[LANG]?.cancel || "Cancel",
+      choices
+    });
+    if (!val) return;
+    try {
+      await setParam("LanguageSetting", val);
+      const rebootMsg = LANG === "ko" ? "설정이 변경되었습니다. 지금 재부팅하시겠습니까?" : "Setting changed. Reboot now?";
+      if (await appConfirm(rebootMsg, { title: "Reboot" })) {
+        await runTool("reboot");
+      }
+    } catch (e) {
+      showError("shell_cmd", e);
+    }
   });
 
 
@@ -2575,6 +3045,61 @@ function initToolsPage() {
     inp.click();
   });
 
+  function getAllSettingNames(settingsObj) {
+    if (!settingsObj || !settingsObj.items_by_group) return [];
+    const names = [];
+    Object.values(settingsObj.items_by_group).forEach(list => {
+      list.forEach(item => names.push(item.name));
+    });
+    return names;
+  }
+
+  bindOnce("btnCopySettings", async () => {
+    try {
+      if (!SETTINGS || !SETTINGS.items_by_group) {
+        const r = await fetch("/api/settings");
+        const j = await r.json();
+        if (j.ok) SETTINGS = j;
+      }
+      if (!SETTINGS || !SETTINGS.items_by_group) {
+        toolsLogNotice("Settings not loaded", { label: "copy settings" });
+        return;
+      }
+      const allNames = getAllSettingNames(SETTINGS);
+      const values = await bulkGet(allNames);
+      const lines = allNames.map(n => `${n}=${values[n] ?? ""}`);
+      const text = lines.join("\n");
+      copyToClipboard(text);
+      toolsLogNotice(LANG === "ko" ? `${allNames.length}개 파라미터 복사됨` : `${allNames.length} params copied`, { label: "copy settings" });
+    } catch (e) {
+      showError("copy settings", e);
+    }
+  });
+
+  bindOnce("btnViewSettings", async () => {
+    try {
+      if (!SETTINGS || !SETTINGS.items_by_group) {
+        const r = await fetch("/api/settings");
+        const j = await r.json();
+        if (j.ok) SETTINGS = j;
+      }
+      if (!SETTINGS || !SETTINGS.items_by_group) {
+        toolsLogNotice("Settings not loaded", { label: "view settings" });
+        return;
+      }
+      const allNames = getAllSettingNames(SETTINGS);
+      const values = await bulkGet(allNames);
+      const lines = allNames.map(n => `${n} = ${values[n] ?? "(empty)"}`);
+      const text = lines.join("\n");
+      appAlert(text, {
+        title: `Settings (${allNames.length} params)`,
+        copyText: text,
+      });
+    } catch (e) {
+      showError("view settings", e);
+    }
+  });
+
   bindOnce("btnReboot", async () => {
     if (!await appConfirm(UI_STRINGS[LANG].confirm_reboot || "Reboot now?", {
       title: UI_STRINGS[LANG].reboot || "Reboot",
@@ -2625,17 +3150,27 @@ function initToolsPage() {
 
 async function loadBranchesAndShow() {
   if (!appBranchPickerMeta || !appBranchPickerList || !openBranchPicker()) {
-    showAppToast(UI_STRINGS[LANG].branch_dom_missing || "Branch DOM missing", { tone: "error" });
+    toolsLogNotice(UI_STRINGS[LANG].branch_dom_missing || "Branch DOM missing", { label: "git_branch_list" });
     return;
   }
   appBranchPickerMeta.textContent = "loading...";
   appBranchPickerList.innerHTML = "";
   BRANCHES = [];
   CURRENT_BRANCH_NAME = "";
+  resetBranchRemoteContext();
+
+  try {
+    const v = await bulkGet(["GitRemote"]);
+    if (v && v.GitRemote) {
+      const owner = parseGitHubOwner(v.GitRemote);
+      if (owner) ORIGIN_USERNAME = owner;
+    }
+  } catch(e) {}
 
   try {
     const j = await runTool("git_branch_list");
-    BRANCHES = j.branches || [];
+    syncBranchRemoteContext(j);
+    BRANCHES = normalizeBranchItems(j);
     CURRENT_BRANCH_NAME = (j.current_branch || "").trim();
     appBranchPickerMeta.textContent = `${BRANCHES.length} branches`;
 
@@ -2657,39 +3192,83 @@ function renderBranchList() {
     return;
   }
 
-  for (const br of BRANCHES) {
-    const b = document.createElement("button");
-    b.className = "btn groupBtn app-branch-picker__item";
-    if (CURRENT_BRANCH_NAME && br === CURRENT_BRANCH_NAME) {
-      b.classList.add("is-current");
+  for (const group of getBranchGroups()) {
+    const open = isBranchGroupOpen(group);
+    const section = document.createElement("div");
+    section.className = "app-branch-picker__group";
+    section.classList.toggle("is-open", open);
+
+    const head = document.createElement("button");
+    head.className = "app-branch-picker__groupHead";
+    head.type = "button";
+    head.setAttribute("aria-expanded", open ? "true" : "false");
+
+    const icon = document.createElement("span");
+    icon.className = "app-branch-picker__groupIcon";
+    icon.textContent = open ? "▼" : "▶";
+    head.appendChild(icon);
+
+    const title = document.createElement("span");
+    title.className = "app-branch-picker__groupTitle";
+    title.textContent = group.title;
+    head.appendChild(title);
+
+    const count = document.createElement("span");
+    count.className = "app-branch-picker__groupCount";
+    count.textContent = branchCountLabel(group.items.length);
+    head.appendChild(count);
+
+    head.onclick = () => {
+      BRANCH_GROUP_OPEN[group.key] = !open;
+      renderBranchList();
+    };
+    section.appendChild(head);
+
+    if (open) {
+      const items = document.createElement("div");
+      items.className = "app-branch-picker__groupItems";
+
+      for (const item of group.items) {
+        const b = document.createElement("button");
+        b.className = "btn groupBtn app-branch-picker__item";
+        if (item.current) {
+          b.classList.add("is-current");
+        }
+        b.title = item.ref;
+
+        const label = document.createElement("span");
+        label.className = "app-branch-picker__label";
+        label.textContent = item.label;
+        b.appendChild(label);
+
+        if (item.current) {
+          const badge = document.createElement("span");
+          badge.className = "app-branch-picker__badge";
+          badge.textContent = getUIText("branch_current", "Current");
+          b.appendChild(badge);
+        }
+
+        b.onclick = () => onSelectBranch(item);
+        items.appendChild(b);
+      }
+
+      section.appendChild(items);
     }
 
-    const label = document.createElement("span");
-    label.className = "app-branch-picker__label";
-    label.textContent = br;
-    b.appendChild(label);
-
-    if (CURRENT_BRANCH_NAME && br === CURRENT_BRANCH_NAME) {
-      const badge = document.createElement("span");
-      badge.className = "app-branch-picker__badge";
-      badge.textContent = getUIText("branch_current", "Current");
-      b.appendChild(badge);
-    }
-
-    b.onclick = () => onSelectBranch(br);
-    appBranchPickerList.appendChild(b);
+    appBranchPickerList.appendChild(section);
   }
 }
 
-async function onSelectBranch(branch) {
+async function onSelectBranch(item) {
+  const branch = String(item?.ref || item || "").trim();
   closeBranchPicker(true);
   if (!await appConfirm((UI_STRINGS[LANG].checkout_confirm || "Switch to this branch?") + `\n\n${branch}`, {
     title: "git checkout",
   })) return;
 
   try {
-    await runTool("git_checkout", { branch });
-    showAppToast(UI_STRINGS[LANG].branch_changed || "Branch changed.", { tone: "success" });
+    await runTool("git_checkout", item?.checkoutPayload || { branch });
+    toolsLogNotice(UI_STRINGS[LANG].branch_changed || "Branch changed.", { label: "git_checkout" });
   } catch (e) {
     showError("git_checkout", e);
     return;
@@ -2702,7 +3281,7 @@ async function onSelectBranch(branch) {
 
   try {
     await runTool("reboot");
-    showAppToast(UI_STRINGS[LANG].rebooting || "Rebooting...", { tone: "success" });
+    toolsLogNotice(UI_STRINGS[LANG].rebooting || "Rebooting...", { label: "reboot" });
   } catch (e) {
     showError("reboot", e);
   }
